@@ -1,6 +1,6 @@
 """
 Janela Principal do Storage Rescue (interface/main_window.py).
-Integra a barra lateral de navegação, o trabalhador assíncrono de inventário (QThread)
+Integra a barra lateral de navegação, o trabalhador assíncrono de inventário e diagnóstico (QThread)
 e os módulos da aplicação.
 """
 
@@ -21,6 +21,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.diagnostics_engine import (
+    DeviceDiagnosticReport,
+    DiagnosticsEngine,
+    UsbBusDiagnosticItem,
+)
 from core.disk_manager import DiskManager
 from core.logger import logger
 from core.models import DashboardMetrics, DiskDevice
@@ -35,25 +40,39 @@ from interface.theme import APP_STYLESHEET
 
 
 class InventoryWorker(QThread):
-    """Thread de segundo plano para varredura somente leitura dos dispositivos de armazenamento."""
+    """Thread de segundo plano para varredura somente leitura e diagnóstico dos dispositivos."""
 
-    inventory_ready = Signal(list, object)
+    inventory_ready = Signal(list, object, list, list)
 
-    def __init__(self, disk_manager: DiskManager, history_repo: HistoryRepository, simulation_mode: bool = False) -> None:
+    def __init__(
+        self,
+        disk_manager: DiskManager,
+        diagnostics_engine: DiagnosticsEngine,
+        history_repo: HistoryRepository,
+        simulation_mode: bool = False,
+    ) -> None:
         super().__init__()
         self.disk_manager = disk_manager
+        self.diagnostics_engine = diagnostics_engine
         self.history_repo = history_repo
         self.simulation_mode = simulation_mode
 
     def run(self) -> None:
         devices = self.disk_manager.collect_inventory(simulation_mode=self.simulation_mode)
+        usb_items, io_events_by_disk = self.diagnostics_engine.scan_usb_bus_and_ghost_devices(
+            simulation_mode=self.simulation_mode
+        )
+        reports = self.diagnostics_engine.diagnose_all_devices(
+            devices=devices,
+            io_events_by_disk=io_events_by_disk,
+        )
         last_diag = self.history_repo.get_last_diagnostic_summary()
         metrics = self.disk_manager.compute_dashboard_metrics(
             devices=devices,
             last_diagnostic_time=last_diag,
             is_simulation=self.simulation_mode,
         )
-        self.inventory_ready.emit(devices, metrics)
+        self.inventory_ready.emit(devices, metrics, reports, usb_items)
 
 
 class MainWindow(QMainWindow):
@@ -66,6 +85,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(APP_STYLESHEET)
 
         self.disk_manager = DiskManager(use_smartctl=True)
+        self.diagnostics_engine = DiagnosticsEngine()
         self.history_repo = HistoryRepository()
         self.simulation_mode = False
         self._worker: InventoryWorker | None = None
@@ -99,7 +119,7 @@ class MainWindow(QMainWindow):
         nav_items = [
             ("📊 Dashboard Principal", 0),
             ("💽 Dispositivos e Partições", 1),
-            ("🩺 Diagnóstico (Etapa 2)", 2),
+            ("🩺 Diagnóstico Completo", 2),
             ("🛠️ Recuperação Lógica (Etapa 5)", 3),
             ("🧹 Preparação Segura (Etapa 6)", 4),
             ("📋 Histórico e Relatórios (Etapa 3)", 5),
@@ -154,10 +174,11 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.stack, stretch=1)
 
-        # Conexões de sinais do Dashboard
+        # Conexões de sinais
         self.dashboard_view.refresh_requested.connect(self.trigger_inventory_refresh)
         self.dashboard_view.simulation_toggled.connect(self._on_simulation_toggled)
         self.dashboard_view.device_selected.connect(self._on_device_inspect_requested)
+        self.diagnostics_view.run_diagnostics_requested.connect(self.trigger_inventory_refresh)
 
         # Barra de Status inferior
         status_bar = QStatusBar()
@@ -184,30 +205,45 @@ class MainWindow(QMainWindow):
         self.switch_page(1)
 
     def trigger_inventory_refresh(self) -> None:
-        """Inicia a varredura de discos em background sem bloquear a interface."""
+        """Inicia a varredura de discos e diagnóstico em background sem bloquear a interface."""
         if self._worker and self._worker.isRunning():
             return
 
         self.dashboard_view.set_loading_state(True)
         mode_str = "Modo Simulação de Bancada" if self.simulation_mode else "Hardware Real (Somente Leitura)"
-        self.statusBar().showMessage(f"Consultando dispositivos de armazenamento ({mode_str})...")
+        self.statusBar().showMessage(f"Consultando e diagnosticando dispositivos ({mode_str})...")
 
         self._worker = InventoryWorker(
             disk_manager=self.disk_manager,
+            diagnostics_engine=self.diagnostics_engine,
             history_repo=self.history_repo,
             simulation_mode=self.simulation_mode,
         )
         self._worker.inventory_ready.connect(self._on_inventory_ready)
         self._worker.start()
 
-    def _on_inventory_ready(self, devices: List[DiskDevice], metrics: DashboardMetrics) -> None:
+    def _on_inventory_ready(
+        self,
+        devices: List[DiskDevice],
+        metrics: DashboardMetrics,
+        reports: List[DeviceDiagnosticReport],
+        usb_items: List[UsbBusDiagnosticItem],
+    ) -> None:
         self.dashboard_view.set_loading_state(False)
         self.dashboard_view.update_dashboard(devices, metrics)
         self.devices_view.set_devices(devices)
+        self.diagnostics_view.update_diagnostics(reports, usb_items)
 
         mode_tag = "[SIMULAÇÃO DE BANCADA]" if self.simulation_mode else "[SOMENTE LEITURA REAL]"
         self.statusBar().showMessage(
-            f"{mode_tag} Inventário atualizado: {metrics.total_disks} disco(s) encontrado(s) | "
-            f"Capacidade Total: {metrics.total_capacity_formatted} | Alertas: {metrics.alert_devices_count}"
+            f"{mode_tag} Diagnóstico atualizado: {metrics.total_disks} disco(s) | "
+            f"Capacidade Total: {metrics.total_capacity_formatted} | "
+            f"Alertas em Discos: {metrics.alert_devices_count} | "
+            f"Ocorrências no Barramento USB/Kernel: {len(usb_items)}"
         )
-        logger.info("Interface atualizada com %d dispositivos.", len(devices))
+        logger.info(
+            "Interface atualizada: %d discos, %d laudos, %d ocorrências USB/Kernel.",
+            len(devices),
+            len(reports),
+            len(usb_items),
+        )
