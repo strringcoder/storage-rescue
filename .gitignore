@@ -1,0 +1,35 @@
+# Byte-compiled / cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Empacotamento e Build (PyInstaller - Etapa 8)
+build/
+dist/
+
+# Banco de dados local e logs de execução (dados locais da bancada)
+database/*.db
+database/*.db-journal
+database/*.db-wal
+logs/*.log
+logs/*.log.*
+reports/*.txt
+reports/*.json
+reports/*.html
+
+# Mantém a estrutura de pastas vazias no Git
+!logs/.gitkeep
+!reports/.gitkeep
+
+# Arquivos de sistema e IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
